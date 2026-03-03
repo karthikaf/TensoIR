@@ -1,0 +1,48 @@
+# =========================
+# Python & Environment
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+env/
+venv/
+.env
+.venv/
+*.egg-info/
+
+# =========================
+# IDEs and OS Files
+# =========================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# =========================
+# Thesis Specific (NeRF & TensoIR)
+# =========================
+# Ignore downloaded datasets
+/data/
+/dataset/
+/Datasets/
+
+# Ignore massive model checkpoints
+/checkpoints/
+/log/
+/logs/
+*.pth
+*.pt
+*.ckpt
+
+# Ignore rendered outputs (images and videos)
+*.png
+*.jpg
+*.jpeg
+*.mp4
+*.gif
+/render/
+/renders/
+
+# Ignore TensorBoard logs
+events.out.tfevents.*
