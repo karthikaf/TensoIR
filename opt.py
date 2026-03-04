@@ -63,7 +63,21 @@ def config_parser(cmd=None):
                         help='loss weight')
     parser.add_argument("--TV_weight_app", type=float, default=0.0,
                         help='loss weight')
-    
+
+    # S3IM loss
+    parser.add_argument("--s3im_weight", type=float, default=0.0,
+                        help='weight for S3IM loss (0 = disabled)')
+    parser.add_argument("--s3im_kernel_size", type=int, default=4,
+                        help='kernel size for SSIM convolution in S3IM')
+    parser.add_argument("--s3im_stride", type=int, default=4,
+                        help='stride for SSIM convolution in S3IM')
+    parser.add_argument("--s3im_repeat_time", type=int, default=10,
+                        help='number of random reshuffles for virtual patches')
+    parser.add_argument("--s3im_patch_height", type=int, default=64,
+                        help='height of virtual patch (patch_height * patch_width must equal batch_size)')
+    parser.add_argument("--s3im_patch_width", type=int, default=64,
+                        help='width of virtual patch (patch_height * patch_width must equal batch_size)')
+
     # model
     # volume options
     parser.add_argument("--n_lamb_sigma", type=int, action="append")

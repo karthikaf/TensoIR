@@ -11,6 +11,7 @@ from torch.utils.tensorboard import SummaryWriter
 from renderer import * 
 from models.tensoRF_rotated_lights import raw2alpha, TensorVMSplit, AlphaGridMask
 from utils import *
+from utils.s3im_loss import S3IM
 from dataLoader import dataset_dict
 
 
@@ -222,6 +223,21 @@ def reconstruction(args):
     tvreg = TVLoss()
     print(f"initial TV_weight density: {TV_weight_density} appearance: {TV_weight_app}")
 
+    # S3IM loss
+    s3im_loss_fn = None
+    if args.s3im_weight > 0:
+        s3im_loss_fn = S3IM(
+            kernel_size=args.s3im_kernel_size,
+            stride=args.s3im_stride,
+            repeat_time=args.s3im_repeat_time,
+            patch_height=args.s3im_patch_height,
+            patch_width=args.s3im_patch_width,
+        ).to(device)
+        print(f"S3IM loss enabled with weight={args.s3im_weight}, "
+              f"kernel_size={args.s3im_kernel_size}, stride={args.s3im_stride}, "
+              f"repeat_time={args.s3im_repeat_time}, "
+              f"patch={args.s3im_patch_height}x{args.s3im_patch_width}")
+
 
     all_rays, all_rgbs, all_masks, all_light_idx = train_dataset.all_rays, train_dataset.all_rgbs, train_dataset.all_masks, train_dataset.all_light_idx
     # Filter rays outside the bbox
@@ -263,6 +279,11 @@ def reconstruction(args):
         loss_rgb_brdf = torch.tensor(1e-6).to(device)
         loss_rgb = torch.mean((ret_kw['rgb_map'] - rgb_train) ** 2)
         total_loss += loss_rgb
+
+        # S3IM loss
+        if s3im_loss_fn is not None:
+            loss_s3im = args.s3im_weight * s3im_loss_fn(ret_kw['rgb_map'], rgb_train)
+            total_loss += loss_s3im
 
         if Ortho_reg_weight > 0:
             loss_reg = tensoIR.vector_comp_diffs()
@@ -329,6 +350,8 @@ def reconstruction(args):
             summary_writer.add_scalar('train/mse', total_loss, global_step=iteration)
             summary_writer.add_scalar('train/PSNRs_rgb', PSNRs_rgb[-1], global_step=iteration)
             summary_writer.add_scalar('train/mse_rgb', loss_rgb, global_step=iteration)
+            if s3im_loss_fn is not None:
+                summary_writer.add_scalar('train/s3im_loss', loss_s3im.detach().item(), global_step=iteration)
             if relight_flag:
                 summary_writer.add_scalar('train/PSNRs_rgb_brdf', PSNRs_rgb_brdf[-1], global_step=iteration)
                 summary_writer.add_scalar('train/mse_rgb_brdf', loss_rgb_brdf, global_step=iteration)
