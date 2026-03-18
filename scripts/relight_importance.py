@@ -243,7 +243,7 @@ def relight(dataset, args):
         if args.if_save_depth:
             imageio.imwrite(os.path.join(cur_dir_path, 'depth.png'), depth_map)
         if args.if_save_acc:
-            imageio.imwrite(os.path.join(cur_dir_path, 'acc.png'), acc_map)
+            imageio.imwrite(os.path.join(cur_dir_path, 'acc.png'), acc_map.squeeze(-1))
         if args.if_save_albedo:
             gt_albedo_reshaped = gt_albedo.reshape(H, W, 3).cpu()
             albedo_map = albedo_map.reshape(H, W, 3)
