@@ -128,7 +128,7 @@ class MLPRender_Fea(torch.nn.Module):
         self.feape = feape
         layer1 = torch.nn.Linear(self.in_mlpC, featureC)
         layer2 = torch.nn.Linear(featureC, featureC)
-        layer3 = torch.nn.Linear(featureC, 3)
+        layer3 = torch.nn.Linear(featureC, 6)  # NeP: 6 channels (3 pseudo-albedo + 3 lighting modulation)
 
         self.mlp = torch.nn.Sequential(layer1, torch.nn.ReLU(inplace=True), layer2, torch.nn.ReLU(inplace=True), layer3)
         torch.nn.init.constant_(self.mlp[-1].bias, 0)
@@ -140,10 +140,14 @@ class MLPRender_Fea(torch.nn.Module):
         if self.viewpe > 0:
             indata += [positional_encoding(viewdirs, self.viewpe)]
         mlp_in = torch.cat(indata, dim=-1)
-        rgb = self.mlp(mlp_in)
-        rgb = torch.sigmoid(rgb)
+        out = self.mlp(mlp_in)
 
-        return rgb
+        # NeP Eq. 3: Decouple into pseudo-albedo and lighting modulation
+        c_a = torch.sigmoid(out[..., :3])  # Pseudo-albedo (view-independent base)
+        c_l = torch.sigmoid(out[..., 3:])  # Lighting modulation (view-dependent)
+        c_o = c_a * c_l                     # Final color
+
+        return c_o, c_a
 
 
 class MLPBRDF_Fea(torch.nn.Module):
@@ -892,8 +896,10 @@ class TensorBase(torch.nn.Module):
             ray_valid = ~ray_invalid
 
         # Create empty tensor to store sigma and rgb
+        
         sigma = torch.zeros(xyz_sampled.shape[:-1], device=xyz_sampled.device)
         rgb = torch.zeros((*xyz_sampled.shape[:2], 3), device=xyz_sampled.device)
+        pseudo_albedo = torch.zeros((*xyz_sampled.shape[:2], 3), device=xyz_sampled.device)  # NeP: pseudo-albedo per sample
 
         # Create empty tensor to store normal, roughness, fresnel
         
@@ -921,7 +927,9 @@ class TensorBase(torch.nn.Module):
             radiance_field_feat, intrinsic_feat = self.compute_bothfeature(xyz_sampled[app_mask], light_idx[app_mask])
             
             # RGB
-            rgb[app_mask] = self.renderModule(xyz_sampled[app_mask], viewdirs[app_mask], radiance_field_feat)
+            valid_rgbs, valid_pseudo_albedo = self.renderModule(xyz_sampled[app_mask], viewdirs[app_mask], radiance_field_feat)
+            rgb[app_mask] = valid_rgbs
+            pseudo_albedo[app_mask] = valid_pseudo_albedo  # NeP: store pseudo-albedo
             if is_relight: 
                 # BRDF
                 valid_brdf = self.renderModule_brdf(xyz_sampled[app_mask], intrinsic_feat)
@@ -969,16 +977,18 @@ class TensorBase(torch.nn.Module):
         acc_map = torch.sum(weight, -1)
         depth_map = torch.sum(weight * z_vals, -1)
         rgb_map = torch.sum(weight[..., None] * rgb, -2)
+        pseudo_albedo_map = torch.sum(weight[..., None] * pseudo_albedo, -2)  # NeP: volume-render pseudo-albedo
 
         if not is_relight:
             if white_bg or (is_train and torch.rand((1,)) < 0.5):
                 depth_map = depth_map + (1. - acc_map) * rays_chunk[..., -1]
                 rgb_map = rgb_map + (1. - acc_map[..., None])
+                pseudo_albedo_map = pseudo_albedo_map + (1. - acc_map[..., None])  # NeP
                 
             return  rgb_map, depth_map, None, \
                     None, None, None, \
                     acc_map, None, None, None, \
-                    None, None
+                    None, None, pseudo_albedo_map
         else:
             normal_map = torch.sum(weight[..., None] * normal, -2)
             normals_diff_map = torch.sum(weight[..., None] * normals_diff, -2)
@@ -1025,7 +1035,11 @@ class TensorBase(torch.nn.Module):
 
             acc_mask = acc_map > 0.5 # where there may be intersected surface points
 
+            # NeP: white bg for pseudo-albedo in relight path
+            pseudo_albedo_map = pseudo_albedo_map + (1 - acc_map[..., None]) if (white_bg or (is_train and torch.rand((1,)) < 0.5)) else pseudo_albedo_map
+            pseudo_albedo_map = pseudo_albedo_map.clamp(0, 1)
+
             return  rgb_map, depth_map, normal_map, \
                     albedo_map, roughness_map, fresnel_map, \
                     acc_map, normals_diff_map, normals_orientation_loss_map, acc_mask, \
-                    albedo_smoothness_loss, roughness_smoothness_loss
+                    albedo_smoothness_loss, roughness_smoothness_loss, pseudo_albedo_map

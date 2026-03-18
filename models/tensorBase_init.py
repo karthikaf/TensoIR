@@ -65,7 +65,7 @@ class MLPRender_Fea(torch.nn.Module):
         self.feape = feape
         layer1 = torch.nn.Linear(self.in_mlpC, featureC)
         layer2 = torch.nn.Linear(featureC, featureC)
-        layer3 = torch.nn.Linear(featureC,3)
+        layer3 = torch.nn.Linear(featureC, 6)  # NeP: 6 channels (3 pseudo-albedo + 3 lighting modulation)
 
         self.mlp = torch.nn.Sequential(layer1, torch.nn.ReLU(inplace=True), layer2, torch.nn.ReLU(inplace=True), layer3)
         torch.nn.init.constant_(self.mlp[-1].bias, 0)
@@ -77,10 +77,14 @@ class MLPRender_Fea(torch.nn.Module):
         if self.viewpe > 0:
             indata += [positional_encoding(viewdirs, self.viewpe)]
         mlp_in = torch.cat(indata, dim=-1)
-        rgb = self.mlp(mlp_in)
-        rgb = torch.sigmoid(rgb)
+        out = self.mlp(mlp_in)
 
-        return rgb
+        # NeP Eq. 3: Decouple into pseudo-albedo and lighting modulation
+        c_a = torch.sigmoid(out[..., :3])  # Pseudo-albedo (view-independent base)
+        c_l = torch.sigmoid(out[..., 3:])  # Lighting modulation (view-dependent)
+        c_o = c_a * c_l                     # Final color
+
+        return c_o, c_a
 
 class MLPRender_PE(torch.nn.Module):
     def __init__(self,inChanel, viewpe=6, pospe=6, featureC=128):
@@ -428,6 +432,7 @@ class TensorBase_Init(torch.nn.Module):
 
         sigma = torch.zeros(xyz_sampled.shape[:-1], device=xyz_sampled.device)
         rgb = torch.zeros((*xyz_sampled.shape[:2], 3), device=xyz_sampled.device)
+        pseudo_albedo = torch.zeros((*xyz_sampled.shape[:2], 3), device=xyz_sampled.device)  # NeP: pseudo-albedo per sample
 
         if ray_valid.any():
             xyz_sampled = self.normalize_coord(xyz_sampled)
@@ -443,20 +448,24 @@ class TensorBase_Init(torch.nn.Module):
 
         if app_mask.any():
             app_features = self.compute_appfeature(xyz_sampled[app_mask])
-            valid_rgbs = self.renderModule(xyz_sampled[app_mask], viewdirs[app_mask], app_features)
+            valid_rgbs, valid_pseudo_albedo = self.renderModule(xyz_sampled[app_mask], viewdirs[app_mask], app_features)
             rgb[app_mask] = valid_rgbs
+            pseudo_albedo[app_mask] = valid_pseudo_albedo  # NeP: store pseudo-albedo
 
         acc_map = torch.sum(weight, -1)
         rgb_map = torch.sum(weight[..., None] * rgb, -2)
+        pseudo_albedo_map = torch.sum(weight[..., None] * pseudo_albedo, -2)  # NeP: volume-render pseudo-albedo
 
         if white_bg or (is_train and torch.rand((1,))<0.5):
             rgb_map = rgb_map + (1. - acc_map[..., None])
+            pseudo_albedo_map = pseudo_albedo_map + (1. - acc_map[..., None])  # NeP: white bg for pseudo-albedo
 
         
         rgb_map = rgb_map.clamp(0,1)
+        pseudo_albedo_map = pseudo_albedo_map.clamp(0,1)  # NeP
 
         with torch.no_grad():
             depth_map = torch.sum(weight * z_vals, -1)
             depth_map = depth_map + (1. - acc_map) * rays_chunk[..., -1]
 
-        return rgb_map, depth_map # rgb, sigma, alpha, weight, bg_weight
+        return rgb_map, depth_map, pseudo_albedo_map  # NeP: added pseudo_albedo_map
