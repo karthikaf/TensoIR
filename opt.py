@@ -78,6 +78,14 @@ def config_parser(cmd=None):
     parser.add_argument("--s3im_patch_width", type=int, default=64,
                         help='width of virtual patch (patch_height * patch_width must equal batch_size)')
 
+    # NeP dynamic weighting (Phase 2)
+    parser.add_argument("--nep_dynamic_weight", type=int, default=1,
+                        help='enable NeP dynamic weighting for MSE loss (0 = disabled, 1 = enabled)')
+    parser.add_argument("--nep_epsilon", type=float, default=1e-5,
+                        help='numerical stability constant in w_s = 1/(color_diff + epsilon)')
+    parser.add_argument("--nep_clamp_max", type=float, default=1.5,
+                        help='upper clamp for dynamic weight w_s (hyperparameter u in NeP Eq. 4)')
+
     # model
     # volume options
     parser.add_argument("--n_lamb_sigma", type=int, action="append")

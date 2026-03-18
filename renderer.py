@@ -75,7 +75,7 @@ def Renderer_TensoIR_train(
     light_idx = light_idx.to(device, torch.int32)
     rgb_map, depth_map, normal_map, albedo_map, roughness_map, \
         fresnel_map, acc_map, normals_diff_map, normals_orientation_loss_map, \
-        acc_mask, albedo_smoothness_loss, roughness_smoothness_loss \
+        acc_mask, albedo_smoothness_loss, roughness_smoothness_loss, pseudo_albedo_map \
         = tensoIR(rays, light_idx, is_train=is_train, white_bg=white_bg, is_relight=is_relight, ndc_ray=ndc_ray, N_samples=N_samples)
 
     # If use GT normals
@@ -122,6 +122,7 @@ def Renderer_TensoIR_train(
         'normals_orientation_loss_map': normals_orientation_loss_map,
         'albedo_smoothness_loss': albedo_smoothness_loss,
         'roughness_smoothness_loss': roughness_smoothness_loss,
+        'pseudo_albedo_map': pseudo_albedo_map,  # NeP: for dynamic weighting
     }
 
     return ret_kw
