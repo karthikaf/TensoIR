@@ -11,6 +11,7 @@ from torch.utils.tensorboard import SummaryWriter
 from renderer import * 
 from models.tensoRF_rotated_lights import raw2alpha, TensorVMSplit, AlphaGridMask
 from utils import *
+from utils.s3im_loss import S3IM
 from dataLoader import dataset_dict
 
 
@@ -210,6 +211,54 @@ def reconstruction(args):
 
 
 
+    # --- Stage 2: Freeze Geometry and Environmental Lighting Field ---
+    if args.stage == 2:
+        print("--- STAGE 2: Freezing Geometry and Environmental Lighting Field ---")
+        # Freeze the spatial tensor grids (Density & Appearance)
+        for param in tensoIR.density_line.parameters():
+            param.requires_grad = False
+        for param in tensoIR.density_plane.parameters():
+            param.requires_grad = False
+        for param in tensoIR.app_line.parameters():
+            param.requires_grad = False
+        for param in tensoIR.app_plane.parameters():
+            param.requires_grad = False
+
+        # Freeze the basis matrix and light embedding
+        for param in tensoIR.basis_mat.parameters():
+            param.requires_grad = False
+        for param in tensoIR.light_line.parameters():
+            param.requires_grad = False
+
+        # Freeze the environment lighting parameters
+        if tensoIR.light_kind == 'sg':
+            tensoIR.lgtSGs.requires_grad = False
+        elif tensoIR.light_kind == 'pixel':
+            tensoIR._light_rgbs.requires_grad = False
+
+        # Freeze the Stage 1 Color MLP
+        if isinstance(tensoIR.renderModule, torch.nn.Module):
+            for param in tensoIR.renderModule.parameters():
+                param.requires_grad = False
+
+        # Ensure BRDF MLP IS trainable
+        if isinstance(tensoIR.renderModule_brdf, torch.nn.Module):
+            for param in tensoIR.renderModule_brdf.parameters():
+                param.requires_grad = True
+
+        # Ensure Normal MLP IS trainable (if it exists)
+        if hasattr(tensoIR, 'renderModule_normal') and isinstance(tensoIR.renderModule_normal, torch.nn.Module):
+            for param in tensoIR.renderModule_normal.parameters():
+                param.requires_grad = True
+
+        # Print summary of trainable vs frozen parameters
+        total_params = sum(p.numel() for p in tensoIR.parameters())
+        trainable_params = sum(p.numel() for p in tensoIR.parameters() if p.requires_grad)
+        frozen_params = total_params - trainable_params
+        print(f"  Total params: {total_params:,}")
+        print(f"  Trainable params: {trainable_params:,}")
+        print(f"  Frozen params: {frozen_params:,}")
+
     grad_vars = tensoIR.get_optparam_groups(args.lr_init, args.lr_basis)
     if args.lr_decay_iters > 0:
         lr_factor = args.lr_decay_target_ratio ** (1 / (args.lr_decay_iters))
@@ -239,6 +288,21 @@ def reconstruction(args):
     tvreg = TVLoss()
     print(f"initial TV_weight density: {TV_weight_density} appearance: {TV_weight_app}")
 
+    # S3IM loss
+    s3im_loss_fn = None
+    if args.s3im_weight > 0:
+        s3im_loss_fn = S3IM(
+            kernel_size=args.s3im_kernel_size,
+            stride=args.s3im_stride,
+            repeat_time=args.s3im_repeat_time,
+            patch_height=args.s3im_patch_height,
+            patch_width=args.s3im_patch_width,
+        ).to(device)
+        print(f"S3IM loss enabled with weight={args.s3im_weight}, "
+              f"kernel_size={args.s3im_kernel_size}, stride={args.s3im_stride}, "
+              f"repeat_time={args.s3im_repeat_time}, "
+              f"patch={args.s3im_patch_height}x{args.s3im_patch_width}")
+
 
     all_rays, all_rgbs, all_masks, all_light_idx = train_dataset.all_rays, train_dataset.all_rgbs, train_dataset.all_masks, train_dataset.all_light_idx
     # Filter rays outside the bbox
@@ -250,7 +314,8 @@ def reconstruction(args):
     pbar = tqdm(range(args.n_iters), miniters=args.progress_refresh_rate, file=sys.stdout) if (
             (not is_distributed) or (dist.get_rank() == 0)) else range(args.n_iters)
 
-    relight_flag = False
+    # If we are in Stage 2, geometry is frozen so we MUST train BRDF immediately
+    relight_flag = (args.stage == 2)
     for iteration in pbar: 
         # Sample batch_size chunk from all rays
         rays_idx = trainingSampler.nextids()
@@ -304,6 +369,13 @@ def reconstruction(args):
         if relight_flag:
             loss_rgb_brdf = torch.mean((ret_kw['rgb_with_brdf_map'] - rgb_with_brdf_train) ** 2)
             total_loss += loss_rgb_brdf * args.rgb_brdf_weight
+
+            # Step 3.5: Apply S3IM Loss to the final PBR color (Stage 2)
+            # The base S3IM loss function expects [batch_size, 3] and handles the patch reshaping internally
+            if s3im_loss_fn is not None:
+                loss_s3im_brdf = args.s3im_weight * s3im_loss_fn(ret_kw['rgb_with_brdf_map'], rgb_with_brdf_train)
+                total_loss += loss_s3im_brdf
+
             # exponential growth
             normal_weight_factor = args.normals_loss_enhance_ratio ** ((iteration- update_AlphaMask_list[0])/ (args.n_iters - update_AlphaMask_list[0]))
             BRDF_weight_factor = args.BRDF_loss_enhance_ratio ** ((iteration- update_AlphaMask_list[0])/ (args.n_iters - update_AlphaMask_list[0]))
@@ -330,8 +402,11 @@ def reconstruction(args):
 
 
         optimizer.zero_grad()
-        total_loss.backward()
-        optimizer.step()
+        if total_loss.requires_grad:
+            total_loss.backward()
+            optimizer.step()
+        else:
+            print(f"[Warning] Iteration {iteration}: total_loss does not require grad. Check frozen parameters.")
 
         total_loss = total_loss.detach().item()
         loss_rgb = loss_rgb.detach().item()
@@ -349,6 +424,8 @@ def reconstruction(args):
             if relight_flag:
                 summary_writer.add_scalar('train/PSNRs_rgb_brdf', PSNRs_rgb_brdf[-1], global_step=iteration)
                 summary_writer.add_scalar('train/mse_rgb_brdf', loss_rgb_brdf, global_step=iteration)
+                if s3im_loss_fn is not None:
+                    summary_writer.add_scalar('train/s3im_loss_brdf', loss_s3im_brdf.detach().item(), global_step=iteration)
 
             # Print the current values of the losses.
             if iteration % args.progress_refresh_rate == 0:
@@ -429,6 +506,17 @@ def reconstruction(args):
             reso_cur = N_to_reso(n_voxels, tensoIR.aabb)
             nSamples = min(args.nSamples, cal_n_samples(reso_cur, args.step_ratio))
             tensoIR.upsample_volume_grid(reso_cur)
+
+            # Re-apply Stage 2 freezing after upsampling (upsampling creates new nn.Parameters)
+            if args.stage == 2:
+                for param in tensoIR.density_line.parameters():
+                    param.requires_grad = False
+                for param in tensoIR.density_plane.parameters():
+                    param.requires_grad = False
+                for param in tensoIR.app_line.parameters():
+                    param.requires_grad = False
+                for param in tensoIR.app_plane.parameters():
+                    param.requires_grad = False
 
             if args.lr_upsample_reset:
                 print("reset lr to initial")

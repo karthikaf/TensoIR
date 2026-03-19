@@ -86,6 +86,10 @@ def config_parser(cmd=None):
     parser.add_argument("--nep_clamp_max", type=float, default=1.5,
                         help='upper clamp for dynamic weight w_s (hyperparameter u in NeP Eq. 4)')
 
+    # training stage
+    parser.add_argument("--stage", type=int, default=1, choices=[1, 2],
+                        help='training stage: 1 = train all (geometry + env + BRDF), 2 = freeze geometry & env, train BRDF only')
+
     # model
     # volume options
     parser.add_argument("--n_lamb_sigma", type=int, action="append")

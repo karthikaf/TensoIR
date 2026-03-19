@@ -1,4 +1,5 @@
 
+import math
 import numpy as np
 import cv2
 from loguru import logger
@@ -6,6 +7,7 @@ import torch
 import torch.nn.functional as F
 from models.relight_utils import *
 from models.tensoRF_init import raw2alpha
+from models.ipe import integrated_dir_enc   # NeP Step 3.3: cone IPE
 import os
 
 
@@ -400,6 +402,75 @@ def compute_secondary_shading_effects(
 
 
 
+@torch.no_grad()
+def cone_sample_env(tensoIR, refl_dirs, theta_m, light_idx, device, K=8):
+    """
+    Cone-filtered environment map query  (Issue 1 fix for NeP Step 3.3/3.4).
+
+    Samples K directions uniformly on the spherical cap of half-angle `theta_m`
+    centred on `refl_dirs`, queries the env map at each, and returns the simple
+    average.  This replaces the single-point lookup so that roughness (via
+    theta_m) actually affects the returned radiance:
+      - Smooth surface  (theta_m ≈ 0) → tight cone  → sharp specular highlight
+      - Rough  surface  (theta_m large) → wide cone  → blurred, diffuse-like response
+
+    Args:
+        tensoIR  : model with get_light_rgbs()
+        refl_dirs: [bs, 3]  normalised reflection vectors (cone centres)
+        theta_m  : [bs, 1]  cone half-angle in radians (NeP Eq. 10)
+        light_idx: [bs, 1]  light-rotation index per ray
+        device   : torch device
+        K        : int      sample count per cone (default 8)
+
+    Returns:
+        cone_env_light: [bs, 3]  roughness-filtered env radiance
+    """
+    bs = refl_dirs.shape[0]
+
+    # ---- Build an orthonormal frame (t, b, refl) per surface point ----
+    up      = torch.zeros_like(refl_dirs); up[..., 2] = 1.0
+    up_alt  = torch.zeros_like(refl_dirs); up_alt[..., 0] = 1.0
+    near_z  = (torch.abs(refl_dirs[..., 2]) > 0.99).unsqueeze(-1)   # singularity guard
+    up      = torch.where(near_z, up_alt, up)                        # [bs, 3]
+    t       = F.normalize(torch.cross(up, refl_dirs, dim=-1), dim=-1) # [bs, 3]
+    b       = torch.cross(refl_dirs, t, dim=-1)                       # [bs, 3]
+
+    # ---- Uniform sampling on a spherical cap of half-angle theta_m ----
+    u1 = torch.rand(bs, K, device=device)                            # [bs, K]
+    u2 = torch.rand(bs, K, device=device)                            # [bs, K]
+    cos_theta_m = torch.cos(theta_m)                                 # [bs, 1]
+    # z = cos(elevation) uniformly distributed over [cos(theta_m), 1]
+    cos_theta   = 1.0 - u1 * (1.0 - cos_theta_m)                    # [bs, K]
+    sin_theta   = torch.sqrt((1.0 - cos_theta ** 2).clamp(min=0.0)) # [bs, K]
+    phi         = 2.0 * math.pi * u2                                 # [bs, K]
+
+    # Local directions in cone frame (z-axis = refl_dirs)
+    lx = sin_theta * torch.cos(phi)  # [bs, K]
+    ly = sin_theta * torch.sin(phi)  # [bs, K]
+    lz = cos_theta                   # [bs, K]
+
+    # Rotate to world frame:  world_dir = lx*t + ly*b + lz*refl
+    sampled_dirs = (lx.unsqueeze(-1) * t.unsqueeze(1) +
+                    ly.unsqueeze(-1) * b.unsqueeze(1) +
+                    lz.unsqueeze(-1) * refl_dirs.unsqueeze(1))  # [bs, K, 3]
+    sampled_dirs = F.normalize(sampled_dirs, dim=-1)            # [bs, K, 3]
+
+    # ---- Query the env map at all K*bs directions in one batch ----
+    sampled_flat = sampled_dirs.reshape(bs * K, 3)              # [bs*K, 3]
+    env_all      = tensoIR.get_light_rgbs(sampled_flat, device=device)  # [rot, bs*K, 3]
+
+    # Select the correct light rotation per ray
+    idx_flat     = light_idx.squeeze(-1).repeat_interleave(K).long()   # [bs*K] Ensure int64
+    cone_env_flat = env_all.gather(
+        0,
+        idx_flat.view(1, bs * K, 1).expand(1, bs * K, 3)
+    ).squeeze(0)                                                # [bs*K, 3]
+
+    # Average over the K cone samples
+    cone_env_light = cone_env_flat.reshape(bs, K, 3).mean(dim=1)  # [bs, 3]
+    return cone_env_light
+
+
 def render_with_BRDF(
         depth_map,
         normal_map,
@@ -429,50 +500,82 @@ def render_with_BRDF(
     surf2c = -rays_d  # [bs, 3]
     surf2c = safe_l2_normalize(surf2c, dim=-1)  # [bs, 3]
 
-    ## get visibilty map from visibility network or compute it using density
-    cosine = torch.einsum("ijk,ik->ij", surf2l, normal_map)  # surf2l:[bs, envW * envH, 3] * normal_map:[bs, 3] -> cosine:[bs, envW * envH]
-    cosine = torch.clamp(cosine, min=0.0)  # [bs, envW * envH]
-    cosine_mask = (cosine > 1e-6)  # [bs, envW * envH], mask half of the incident light that is behind the surface
-    visibility_compute = torch.zeros((*cosine_mask.shape, 1), device=device)   # [bs, envW * envH, 1]
-    indirect_light = torch.zeros((*cosine_mask.shape, 3), device=device)   # [bs, envW * envH, 3]
-
-    visibility_compute[cosine_mask], \
-        indirect_light[cosine_mask] = compute_secondary_shading_effects(
-                                                        tensoIR=tensoIR,
-                                                        surface_pts=surface_xyz.unsqueeze(1).expand(-1, surf2l.shape[1], -1)[cosine_mask],
-                                                        surf2light=surf2l[cosine_mask],
-                                                        light_idx=light_idx.view(-1, 1, 1).expand((*cosine_mask.shape, 1))[cosine_mask],
-                                                        nSample=args.second_nSample,
-                                                        vis_near=args.second_near,
-                                                        vis_far=args.second_far,
-                                                        chunk_size=chunk_size,
-                                                        device=device
-                                                    )
-    visibility_to_use = visibility_compute
     ## Get BRDF specs
     nlights = surf2l.shape[1]
+
+    # --- Step 3.2 (NeP Eq. 10): Roughness → Cone angle theta_m -------------------
+    _nep_beta            = 0.9
+    _nep_constant_factor = math.sqrt(_nep_beta / (1.0 - _nep_beta))  # 3.0 for beta=0.9
+    roughness_scalar = roughness_map[..., :1]                         # [bs, 1]
+    safe_roughness   = torch.clamp(roughness_scalar, min=1e-3, max=1.0)
+    theta_m = torch.atan((safe_roughness ** 2) * _nep_constant_factor)  # [bs, 1] radians
+    # -------------------------------------------------------------------------------
+
+    # --- Step 3.3 (NeP): IPE over the specular cone --------------------------------
+    # Reflection vector:  R = 2(V·N)N − V   where V = surf2c
+    dot_VN    = torch.sum(surf2c * normal_map, dim=-1, keepdim=True)    # [bs, 1]
+    refl_dirs = F.normalize(2.0 * dot_VN * normal_map - surf2c, dim=-1) # [bs, 3]
+    # Integrated PE: E[PE(x)] over the cone — encodes spread proportional to theta_m.
+    cone_features = integrated_dir_enc(refl_dirs, theta_m, num_freqs=4) # [bs, 24]
+    # -------------------------------------------------------------------------------
+
+    # --- Issue 1 fix: Proper cone-filtered env map query ---------------------------
+    # Sample K directions within the theta_m cone and average the env response.
+    # Rough surface → wide cone → blurred env;  smooth surface → tight cone → sharp.
+    cone_env_light = cone_sample_env(
+        tensoIR, refl_dirs, theta_m, light_idx, device, K=8
+    )  # [bs, 3]
+    # -------------------------------------------------------------------------------
+
+    ## Cosine mask: above-horizon light directions only
+    cosine      = torch.einsum("ijk,ik->ij", surf2l, normal_map)  # [bs, nlights]
+    cosine      = torch.clamp(cosine, min=0.0)
+    cosine_mask = (cosine > 1e-6)                                  # [bs, nlights]
+
+    # --- Issue 2 fix: O(bs) transmittance rays instead of O(bs × nlights) ----------
+    refl_vis, _ = compute_transmittance(
+        tensoIR      = tensoIR,
+        surf_pts     = surface_xyz,      # [bs, 3]
+        light_in_dir = refl_dirs,        # [bs, 3]  (one ray per surface point)
+        nSample      = args.second_nSample,
+        vis_near     = args.second_near,
+        vis_far      = args.second_far,
+        device       = device,
+    )  # [bs, ]  nerv transmittance: 1 = fully visible, 0 = fully occluded
+
+    refl_vis_3d    = refl_vis.view(-1, 1, 1).float()          # [bs, 1, 1]  broadcast-ready
+    cosine_mask_3d = cosine_mask.unsqueeze(-1).float()        # [bs, nlights, 1]
+
+    # Direct light weighting: per-direction cosine mask × per-surface visibility
+    visibility_to_use = refl_vis_3d * cosine_mask_3d          # [bs, nlights, 1]
+    # -------------------------------------------------------------------------------
+
+
     specular = brdf_specular(normal_map, surf2c, surf2l, roughness_map, fresnel_map)  # [bs, envW * envH, 3]
     surface_brdf = albedo_map.unsqueeze(1).expand(-1, nlights, -1) / np.pi + specular # [bs, envW * envH, 3]
 
 
-    ## Compute rendering equation
+    ## Compute rendering equation (Direct Light Integral)
     envir_map_light_rgbs = tensoIR.get_light_rgbs(incident_light_dirs, device=device).to(device) # [light_num, envW * envH, 3]
     direct_light_rgbs = torch.index_select(envir_map_light_rgbs, dim=0, index=light_idx.squeeze(-1)).to(device) # [bs, envW * envH, 3]
     
-    light_rgbs = visibility_to_use * direct_light_rgbs + indirect_light # [bs, envW * envH, 3]
-
-    # # no visibility and indirect light
-    # light_rgbs = direct_light_rgbs
-
-    # # # no indirect light
-    # light_rgbs = visibility_to_use * direct_light_rgbs  # [bs, envW * envH, 3]
+    # 1. Evaluate standard hemispherical integral for direct lighting ONLY
+    light_rgbs_direct = visibility_to_use * direct_light_rgbs # [bs, envW * envH, 3]
 
     if sample_method == 'stratifed_sample_equal_areas':
-        rgb_with_brdf = torch.mean(4 * torch.pi * surface_brdf * light_rgbs * cosine[:, :, None], dim=1)  # [bs, 3]
+        rgb_direct = torch.mean(4 * torch.pi * surface_brdf * light_rgbs_direct * cosine[:, :, None], dim=1)  # [bs, 3]
 
     else:
-        light_pix_contrib = surface_brdf * light_rgbs * cosine[:, :, None] * light_area_weight[None,:, None]   # [bs, envW * envH, 3]
-        rgb_with_brdf = torch.sum(light_pix_contrib, dim=1)  # [bs, 3]
+        light_pix_contrib = surface_brdf * light_rgbs_direct * cosine[:, :, None] * light_area_weight[None,:, None]   # [bs, envW * envH, 3]
+        rgb_direct = torch.sum(light_pix_contrib, dim=1)  # [bs, 3]
+
+    # 2. Add NeP's analytical Cone-filtered Specular Indirect Light
+    # NeP bypasses numerical integration because the cone filters the specular lobe perfectly.
+    # The pre-integrated environment (cone variable) is weighted by visibility occlusion + fresnel.
+    specular_indirect = (1.0 - refl_vis_3d.squeeze(1)) * cone_env_light * fresnel_map  # [bs, 3]
+    
+    rgb_with_brdf = rgb_direct + specular_indirect  # [bs, 3]
+
     ### Tonemapping
     rgb_with_brdf = torch.clamp(rgb_with_brdf, min=0.0, max=1.0)  
     ### Colorspace transform
