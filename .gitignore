@@ -47,3 +47,4 @@ Thumbs.db
 
 # Ignore TensorBoard logs
 events.out.tfevents.*
+old chat.md
