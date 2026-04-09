@@ -343,8 +343,25 @@ def reconstruction(args):
 
         total_loss = 0
         loss_rgb_brdf = torch.tensor(1e-6).to(device)
-        loss_rgb = torch.mean((ret_kw['rgb_map'] - rgb_train) ** 2)
+
+        # NeP Eq. 4: Dynamic weight w_s for specular-aware MSE
+        if args.nep_dynamic_weight:
+            c_o_map = ret_kw['rgb_map']
+            c_a_map = ret_kw['pseudo_albedo_map']
+            color_diff = torch.mean((c_o_map - c_a_map) ** 2, dim=-1, keepdim=True)
+            w_s = 1.0 / (color_diff + args.nep_epsilon)
+            w_s = torch.clamp(w_s, max=args.nep_clamp_max)
+            w_s = w_s.detach()  # CRITICAL: stop gradient through weights!
+            loss_rgb = torch.mean(w_s * (c_o_map - rgb_train) ** 2)
+        else:
+            loss_rgb = torch.mean((ret_kw['rgb_map'] - rgb_train) ** 2)
+
         total_loss += loss_rgb
+
+        # S3IM loss for base geometry/color (Stage 1)
+        if s3im_loss_fn is not None:
+            loss_s3im = args.s3im_weight * s3im_loss_fn(ret_kw['rgb_map'], rgb_train)
+            total_loss += loss_s3im
 
         if Ortho_reg_weight > 0:
             loss_reg = tensoIR.vector_comp_diffs()
@@ -421,6 +438,10 @@ def reconstruction(args):
             summary_writer.add_scalar('train/mse', total_loss, global_step=iteration)
             summary_writer.add_scalar('train/PSNRs_rgb', PSNRs_rgb[-1], global_step=iteration)
             summary_writer.add_scalar('train/mse_rgb', loss_rgb, global_step=iteration)
+            if s3im_loss_fn is not None:
+                summary_writer.add_scalar('train/s3im_loss', loss_s3im.detach().item(), global_step=iteration)
+            if args.nep_dynamic_weight:
+                summary_writer.add_scalar('train/nep_w_s_mean', w_s.mean().item(), global_step=iteration)
             if relight_flag:
                 summary_writer.add_scalar('train/PSNRs_rgb_brdf', PSNRs_rgb_brdf[-1], global_step=iteration)
                 summary_writer.add_scalar('train/mse_rgb_brdf', loss_rgb_brdf, global_step=iteration)

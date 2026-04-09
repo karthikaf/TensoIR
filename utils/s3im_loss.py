@@ -42,23 +42,28 @@ class S3IM(torch.nn.Module):
         Args:
             src_vec: (N, 3) predicted RGB values for N rays
             tar_vec: (N, 3) ground truth RGB values for N rays
+                     N must equal patch_height * patch_width.
 
         Returns:
             loss: scalar, 1 - SSIM of reshuffled virtual patches
         """
-        loss = 0.0
+        assert tar_vec.shape[0] == self.patch_height * self.patch_width, (
+            f"S3IM expects N={self.patch_height * self.patch_width} rays "
+            f"(patch_height={self.patch_height} * patch_width={self.patch_width}), "
+            f"but got N={tar_vec.shape[0]}."
+        )
+        device = tar_vec.device
         index_list = []
         for i in range(self.repeat_time):
             if i == 0:
-                tmp_index = torch.arange(len(tar_vec))
+                tmp_index = torch.arange(len(tar_vec), device=device)
                 index_list.append(tmp_index)
             else:
-                ran_idx = torch.randperm(len(tar_vec))
+                ran_idx = torch.randperm(len(tar_vec), device=device)
                 index_list.append(ran_idx)
         res_index = torch.cat(index_list)
         tar_all = tar_vec[res_index]
         src_all = src_vec[res_index]
         tar_patch = tar_all.permute(1, 0).reshape(1, 3, self.patch_height, self.patch_width * self.repeat_time)
         src_patch = src_all.permute(1, 0).reshape(1, 3, self.patch_height, self.patch_width * self.repeat_time)
-        loss = (1 - self.ssim_loss(src_patch, tar_patch))
-        return loss
+        return 1 - self.ssim_loss(src_patch, tar_patch)
