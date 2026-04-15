@@ -52,7 +52,7 @@ class SimpleSampler:
 
 @torch.no_grad()
 def export_mesh(args):
-    ckpt = torch.load(args.ckpt, map_location=device)
+    ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     kwargs = ckpt['kwargs']
     kwargs.update({'device': device})
     tensoIR = eval(args.model_name)(**kwargs)
@@ -75,7 +75,7 @@ def render_test(args):
         print('the ckpt path does not exists!!')
         return
 
-    ckpt = torch.load(args.ckpt, map_location=device)
+    ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     kwargs = ckpt['kwargs']
     kwargs.update({'device': device})
     tensoIR = eval(args.model_name)(**kwargs)
@@ -179,7 +179,7 @@ def reconstruction(args):
     nSamples = min(args.nSamples, cal_n_samples(reso_cur, args.step_ratio))
 
     if args.ckpt is not None:
-        ckpt = torch.load(args.ckpt, map_location=device)
+        ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
         kwargs = ckpt['kwargs']
         kwargs.update({'device': device})
         tensoIR = eval(args.model_name)(**kwargs)
@@ -314,8 +314,11 @@ def reconstruction(args):
     pbar = tqdm(range(args.n_iters), miniters=args.progress_refresh_rate, file=sys.stdout) if (
             (not is_distributed) or (dist.get_rank() == 0)) else range(args.n_iters)
 
-    # If we are in Stage 2, geometry is frozen so we MUST train BRDF immediately
+    # Stage 2: start with relight_flag=True but gate rendering losses behind warmup
+    # During warmup, only normal/smoothness losses run so BRDF+Normal MLPs stabilise
+    # before the full rgb_brdf + S3IM objective fires.
     relight_flag = (args.stage == 2)
+    stage2_warmup_iters = args.stage2_warmup_iters if args.stage == 2 else 0
     for iteration in pbar: 
         # Sample batch_size chunk from all rays
         rays_idx = trainingSampler.nextids()
@@ -385,13 +388,17 @@ def reconstruction(args):
 
         if relight_flag:
             loss_rgb_brdf = torch.mean((ret_kw['rgb_with_brdf_map'] - rgb_with_brdf_train) ** 2)
-            total_loss += loss_rgb_brdf * args.rgb_brdf_weight
 
-            # Step 3.5: Apply S3IM Loss to the final PBR color (Stage 2)
-            # The base S3IM loss function expects [batch_size, 3] and handles the patch reshaping internally
-            if s3im_loss_fn is not None:
-                loss_s3im_brdf = args.s3im_weight * s3im_loss_fn(ret_kw['rgb_with_brdf_map'], rgb_with_brdf_train)
-                total_loss += loss_s3im_brdf
+            # During Stage 2 warmup: skip rendering and S3IM losses so BRDF/Normal MLPs
+            # stabilise on smoothness/normal losses first before the full objective fires.
+            in_warmup = (stage2_warmup_iters > 0 and iteration < stage2_warmup_iters)
+            if not in_warmup:
+                total_loss += loss_rgb_brdf * args.rgb_brdf_weight
+
+                # Step 3.5: Apply S3IM Loss to the final PBR color (Stage 2)
+                if s3im_loss_fn is not None:
+                    loss_s3im_brdf = args.s3im_weight * s3im_loss_fn(ret_kw['rgb_with_brdf_map'], rgb_with_brdf_train)
+                    total_loss += loss_s3im_brdf
 
             # exponential growth
             normal_weight_factor = args.normals_loss_enhance_ratio ** ((iteration- update_AlphaMask_list[0])/ (args.n_iters - update_AlphaMask_list[0]))
@@ -445,7 +452,7 @@ def reconstruction(args):
             if relight_flag:
                 summary_writer.add_scalar('train/PSNRs_rgb_brdf', PSNRs_rgb_brdf[-1], global_step=iteration)
                 summary_writer.add_scalar('train/mse_rgb_brdf', loss_rgb_brdf, global_step=iteration)
-                if s3im_loss_fn is not None:
+                if s3im_loss_fn is not None and not in_warmup:
                     summary_writer.add_scalar('train/s3im_loss_brdf', loss_s3im_brdf.detach().item(), global_step=iteration)
 
             # Print the current values of the losses.
@@ -522,7 +529,7 @@ def reconstruction(args):
                 trainingSampler = SimpleSampler(rays_filtered.shape[0], args.batch_size)
     
 
-        if iteration in upsamp_list:
+        if iteration in upsamp_list and args.stage != 2:
             n_voxels = N_voxel_list.pop(0)
             reso_cur = N_to_reso(n_voxels, tensoIR.aabb)
             nSamples = min(args.nSamples, cal_n_samples(reso_cur, args.step_ratio))

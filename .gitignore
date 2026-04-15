@@ -27,6 +27,9 @@ Thumbs.db
 /data/
 /dataset/
 /Datasets/
+/research \papers/
+/thesis_plots/
+/TensoIR_results/
 
 # Ignore massive model checkpoints
 /checkpoints/

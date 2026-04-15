@@ -89,6 +89,8 @@ def config_parser(cmd=None):
     # training stage
     parser.add_argument("--stage", type=int, default=1, choices=[1, 2],
                         help='training stage: 1 = train all (geometry + env + BRDF), 2 = freeze geometry & env, train BRDF only')
+    parser.add_argument("--stage2_warmup_iters", type=int, default=0,
+                        help='Stage 2 only: warmup iterations where only normal/smoothness losses run, no rgb_brdf or S3IM. Prevents cold-start collapse of BRDF MLP.')
 
     # model
     # volume options
