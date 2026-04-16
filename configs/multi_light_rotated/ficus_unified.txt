@@ -1,0 +1,90 @@
+dataset_name = tensoIR_unknown_rotated_lights
+datadir = ./data/TensoIR_Synthetic/ficus
+hdrdir = ./data/Environment_Maps/high_res_envmaps_2k
+expname = ficus_unified_v6
+basedir = ./log/log_rotated_multi_lights
+add_timestamp = 1
+downsample_train = 1
+downsample_test = 1
+
+n_iters = 80000
+batch_size = 4096
+lr_decay_iters = 80000
+
+N_voxel_init = 2097152  # 128**3
+N_voxel_final = 64000000  # 400**3
+
+# Upsample schedule: finish at iter 22000, well before NeP ramp
+upsamp_list = [4000, 8000, 12000, 16000, 22000]
+
+# Alpha mask: early shrink matches vanilla (iter 10k ~18-20 dB); avoids disrupting converged geometry
+update_AlphaMask_list = [10000, 15000]
+
+N_vis = 5
+vis_every = 10000
+
+render_test = 1
+
+n_lamb_sigma = [16,16,16]
+n_lamb_sh = [48,48,48]
+model_name = TensorVMSplit
+
+shadingMode = MLP_Fea
+fea2denseAct = softplus
+
+view_pe = 2
+fea_pe = 2
+pos_pe = 2
+
+light_rotation = [000, 120, 240]
+light_kind = sg
+numLgtSGs = 128
+
+normals_kind = derived_plus_predicted
+
+# ── Unified 4-Phase Curriculum ──────────────────────────────────────────────
+unified_curriculum = 1
+
+# Phase A→B: NeP ramps in after shrink recovery (15k→25k)
+# 0–10k: clean geometry; 10k–15k: recover from shrink; 15k–25k: NeP ramp; 25k–50k: full NeP NVS
+nep_dynamic_weight = 1
+nep_ramp_start = 15000
+nep_ramp_end   = 25000
+nep_epsilon    = 1e-5
+nep_clamp_max  = 1.0
+
+# S3IM: rgb ramp from 0.5x to 1.0x over first 10k iters; brdf ramp synced with BRDF activation
+s3im_weight          = 0.1
+s3im_rgb_ramp_end    = 10000
+s3im_brdf_ramp_start = 15000
+s3im_brdf_ramp_end   = 45000
+s3im_kernel_size     = 4
+s3im_stride          = 1
+s3im_repeat_time     = 10
+s3im_patch_height    = 64
+s3im_patch_width     = 64
+
+# Phase C: BRDF activates at 15k (co-trains with NVS from early); 30k ramp then 35k full joint
+brdf_activation_iter = 15000
+brdf_warmup_iters    = 30000
+rgb_brdf_weight      = 0.1
+
+# Normal and BRDF smoothness losses (enhanced over Phase C→D, 30k total)
+normals_diff_weight              = 0.0005
+normals_orientation_weight       = 0.001
+normals_loss_enhance_ratio       = 5
+freeze_density_iter              = 55000
+albedo_smoothness_loss_weight    = 0.001
+roughness_smoothness_loss_weight = 0.001
+BRDF_loss_enhance_ratio          = 10
+# ─────────────────────────────────────────────────────────────────────────────
+
+batch_size_test = 32768
+light_name = sunset
+
+L1_weight_inital = 8e-5
+L1_weight_rest   = 4e-5
+rm_weight_mask_thre = 1e-4
+
+TV_weight_density = 0.05
+TV_weight_app     = 0.005
