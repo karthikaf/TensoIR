@@ -29,7 +29,10 @@ Thumbs.db
 /Datasets/
 /research \papers/
 /thesis_plots/
-/TensoIR_results/
+/TensoIR_Results/
+/reference_thesis/
+/Thesis \Draft/
+/reference_thesis_2/
 
 # Ignore massive model checkpoints
 /checkpoints/
@@ -51,3 +54,13 @@ Thumbs.db
 # Ignore TensorBoard logs
 events.out.tfevents.*
 old chat.md
+
+/relighting
+
+# log files
+/relighting_ficus_v6.log
+/relighting_hotdog_v6.log
+/relighting_lego_v6.log
+/relighting_vanilla_ficus.log
+/relighting_vanilla_hotdog.log
+/relighting_vanilla_lego.log
