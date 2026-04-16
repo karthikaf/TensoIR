@@ -120,15 +120,18 @@ class AlphaGridMask(torch.nn.Module):
 
 
 class MLPRender_Fea(torch.nn.Module):
-    def __init__(self, inChanel, viewpe=6, feape=6, featureC=128):
+    def __init__(self, inChanel, viewpe=6, feape=6, featureC=128, use_nep=True):
         super(MLPRender_Fea, self).__init__()
 
         self.in_mlpC = 2 * viewpe * 3 + 2 * feape * inChanel + 3 + inChanel
         self.viewpe = viewpe
         self.feape = feape
+        self.use_nep = use_nep
         layer1 = torch.nn.Linear(self.in_mlpC, featureC)
         layer2 = torch.nn.Linear(featureC, featureC)
-        layer3 = torch.nn.Linear(featureC, 6)  # NeP: 6 channels (3 pseudo-albedo + 3 lighting modulation)
+        # use_nep=True (NeP): 6 channels (3 pseudo-albedo + 3 lighting modulation)
+        # use_nep=False (vanilla): 3 channels, direct sigmoid — matches original TensoIR
+        layer3 = torch.nn.Linear(featureC, 6 if use_nep else 3)
 
         self.mlp = torch.nn.Sequential(layer1, torch.nn.ReLU(inplace=True), layer2, torch.nn.ReLU(inplace=True), layer3)
         torch.nn.init.constant_(self.mlp[-1].bias, 0)
@@ -142,12 +145,16 @@ class MLPRender_Fea(torch.nn.Module):
         mlp_in = torch.cat(indata, dim=-1)
         out = self.mlp(mlp_in)
 
-        # NeP Eq. 3: Decouple into pseudo-albedo and lighting modulation
-        c_a = torch.sigmoid(out[..., :3])  # Pseudo-albedo (view-independent base)
-        c_l = torch.sigmoid(out[..., 3:])  # Lighting modulation (view-dependent)
-        c_o = c_a * c_l                     # Final color
-
-        return c_o, c_a
+        if self.use_nep:
+            # NeP Eq. 3: Decouple into pseudo-albedo and lighting modulation
+            c_a = torch.sigmoid(out[..., :3])  # Pseudo-albedo (view-independent base)
+            c_l = torch.sigmoid(out[..., 3:])  # Lighting modulation (view-dependent)
+            c_o = c_a * c_l                     # Final color
+            return c_o, c_a
+        else:
+            # Vanilla TensoIR: direct sigmoid rgb, no decomposition
+            c_o = torch.sigmoid(out)
+            return c_o, torch.zeros_like(c_o)  # dummy c_a keeps call sites uniform
 
 
 class MLPBRDF_Fea(torch.nn.Module):
@@ -935,15 +942,19 @@ class TensorBase(torch.nn.Module):
             valid_rgbs, valid_pseudo_albedo = self.renderModule(xyz_sampled[app_mask], viewdirs[app_mask], radiance_field_feat)
             rgb[app_mask] = valid_rgbs
             pseudo_albedo[app_mask] = valid_pseudo_albedo  # NeP: store pseudo-albedo
-            if is_relight: 
+            if is_relight:
+                # Detach backbone features: BRDF/Normal MLPs train on fixed grid features.
+                # NVS path (radiance_field_feat) keeps full gradients → grids stay NVS-optimal.
+                # Safe in Stage 2 as well (grids are frozen there, so detach is a no-op).
+                intrinsic_feat = intrinsic_feat.detach()
                 # BRDF
                 valid_brdf = self.renderModule_brdf(xyz_sampled[app_mask], intrinsic_feat)
                 valid_albedo, valid_roughness = valid_brdf[..., :3], (valid_brdf[..., 3:4] * 0.9 + 0.09)
                 albedo[app_mask] = valid_albedo         # [..., 3]
                 roughness[app_mask] = valid_roughness   # [..., 1]
-                
+
                 xyz_sampled_jittor = xyz_sampled[app_mask] + torch.randn_like(xyz_sampled[app_mask]) * 0.01
-                intrinsic_feat_jittor = self.compute_intrinfeature(xyz_sampled_jittor)
+                intrinsic_feat_jittor = self.compute_intrinfeature(xyz_sampled_jittor).detach()
                 valid_brdf_jittor = self.renderModule_brdf(xyz_sampled_jittor, intrinsic_feat_jittor)
                 valid_albedo_jittor, valid_roughness_jittor = valid_brdf_jittor[..., :3], (valid_brdf_jittor[..., 3:4] * 0.9 + 0.09)
 
@@ -958,22 +969,22 @@ class TensorBase(torch.nn.Module):
                     valid_normals = self.compute_derived_normals(xyz_sampled[app_mask])
                 elif self.normals_kind == "gt_normals":
                     valid_normals = torch.zeros_like(xyz_sampled[app_mask]) # useless
-                elif self.normals_kind == "derived_plus_predicted": 
+                elif self.normals_kind == "derived_plus_predicted":
                     # use the predicted normals and penalize the difference between the predicted normals and derived normas at the same time
                     derived_normals = self.compute_derived_normals(xyz_sampled[app_mask])
                     predicted_normals = self.renderModule_normal(xyz_sampled[app_mask], intrinsic_feat)
                     valid_normals = predicted_normals
-
+                    derived_normals = derived_normals.detach()  # v3: protect density grid from normal supervision gradients
                     normals_diff[app_mask] = torch.sum(torch.pow(predicted_normals - derived_normals, 2), dim=-1, keepdim=True)
-                    normals_orientation_loss[app_mask] = torch.sum(viewdirs[app_mask] * predicted_normals, dim=-1, keepdim=True).clamp(min=0) 
-                    
-                elif self.normals_kind == "residue_prediction":    
+                    normals_orientation_loss[app_mask] = torch.sum(viewdirs[app_mask] * predicted_normals, dim=-1, keepdim=True).clamp(min=0)
+
+                elif self.normals_kind == "residue_prediction":
                     derived_normals = self.compute_derived_normals(xyz_sampled[app_mask])
                     predicted_normals = self.renderModule_normal(xyz_sampled[app_mask], derived_normals, intrinsic_feat)
                     valid_normals = predicted_normals
-
+                    derived_normals = derived_normals.detach()  # v3: protect density grid from normal supervision gradients
                     normals_diff[app_mask] = torch.sum(torch.pow(predicted_normals - derived_normals, 2), dim=-1, keepdim=True)
-                    normals_orientation_loss[app_mask] = torch.sum(viewdirs[app_mask] * predicted_normals, dim=-1, keepdim=True).clamp(min=0)          
+                    normals_orientation_loss[app_mask] = torch.sum(viewdirs[app_mask] * predicted_normals, dim=-1, keepdim=True).clamp(min=0)
 
                 
                 normal[app_mask] = valid_normals
@@ -995,16 +1006,21 @@ class TensorBase(torch.nn.Module):
                     acc_map, None, None, None, \
                     None, None, pseudo_albedo_map
         else:
-            normal_map = torch.sum(weight[..., None] * normal, -2)
-            normals_diff_map = torch.sum(weight[..., None] * normals_diff, -2)
-            normals_orientation_loss_map = torch.sum(weight[..., None] * normals_orientation_loss, -2) 
+            # v4: detach weight for all BRDF/normal outputs — density grid receives only NVS gradients.
+            # rgb_map and acc_map keep full weight (NVS path unchanged).
+            # BRDF/Normal MLPs still train via their own parameters; lgtSGs train via rgb_with_brdf loss.
+            weight_for_brdf = weight.detach()
 
-            albedo_map = torch.sum(weight[..., None] * albedo, -2)  # [..., 3]
-            roughness_map = torch.sum(weight[..., None] * roughness, -2)  # [..., ]
+            normal_map = torch.sum(weight_for_brdf[..., None] * normal, -2)
+            normals_diff_map = torch.sum(weight_for_brdf[..., None] * normals_diff, -2)
+            normals_orientation_loss_map = torch.sum(weight_for_brdf[..., None] * normals_orientation_loss, -2)
+
+            albedo_map = torch.sum(weight_for_brdf[..., None] * albedo, -2)  # [..., 3]
+            roughness_map = torch.sum(weight_for_brdf[..., None] * roughness, -2)  # [..., ]
             fresnel_map = torch.zeros_like(albedo_map).fill_(self.fixed_fresnel)  # [..., 3]
 
-            albedo_smoothness_cost_map = torch.sum(weight[..., None] * albedo_smoothness_cost, -2)  # [..., 1]
-            roughness_smoothness_cost_map = torch.sum(weight[..., None] * roughness_smoothness_cost, -2)  # [..., 1]
+            albedo_smoothness_cost_map = torch.sum(weight_for_brdf[..., None] * albedo_smoothness_cost, -2)  # [..., 1]
+            roughness_smoothness_cost_map = torch.sum(weight_for_brdf[..., None] * roughness_smoothness_cost, -2)  # [..., 1]
 
             albedo_smoothness_loss = torch.mean(albedo_smoothness_cost_map)
             roughness_smoothness_loss = torch.mean(roughness_smoothness_cost_map)

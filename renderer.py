@@ -86,7 +86,7 @@ def Renderer_TensoIR_train(
     if is_relight:
         rgb_with_brdf_masked = render_with_BRDF(   
                                                 depth_map[acc_mask],
-                                                normal_map[acc_mask],
+                                                normal_map[acc_mask].detach(),  # v5: stop gradient to Normal MLP from rgb_with_brdf loss
                                                 albedo_map[acc_mask],
                                                 roughness_map[acc_mask].repeat(1, 3),
                                                 fresnel_map[acc_mask],
