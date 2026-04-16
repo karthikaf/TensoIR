@@ -19,6 +19,31 @@ from dataLoader import dataset_dict
 args = config_parser()
 print(args)
 
+
+# ---------------------------------------------------------------------------
+# Curriculum scheduling helpers
+# ---------------------------------------------------------------------------
+
+def smoothstep(iteration, start, end):
+    """Smooth 0→1 ramp between [start, end]. Returns float in [0, 1]."""
+    if iteration <= start:
+        return 0.0
+    if iteration >= end:
+        return 1.0
+    t = (iteration - start) / (end - start)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def sigmoid_ramp(iteration, ramp_start, ramp_end):
+    """Sigmoid-shaped 0→1 ramp centred at midpoint of [ramp_start, ramp_end]."""
+    if iteration <= ramp_start:
+        return 0.0
+    if iteration >= ramp_end:
+        return 1.0
+    mid = (ramp_start + ramp_end) / 2.0
+    scale = (ramp_end - ramp_start) / 8.0  # ±4σ spans the interval
+    return float(torch.sigmoid(torch.tensor((iteration - mid) / scale)).item())
+
 # Setup multi-device training
 num_gpus = int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
 is_distributed = num_gpus > 1
@@ -212,7 +237,8 @@ def reconstruction(args):
 
 
     # --- Stage 2: Freeze Geometry and Environmental Lighting Field ---
-    if args.stage == 2:
+    # Skipped when unified_curriculum=True — all parameters stay trainable end-to-end.
+    if args.stage == 2 and not args.unified_curriculum:
         print("--- STAGE 2: Freezing Geometry and Environmental Lighting Field ---")
         # Freeze the spatial tensor grids (Density & Appearance)
         for param in tensoIR.density_line.parameters():
@@ -309,6 +335,11 @@ def reconstruction(args):
     rays_filtered, filter_mask  = tensoIR.filtering_rays(all_rays, bbox_only=True)
     rgbs_filtered = all_rgbs[filter_mask, :]                # [filtered(N*H*W), 3]
     light_idx_filtered = all_light_idx[filter_mask, :]      # [filtered(N*H*W), 1]
+    # Perf: move filtered tensors to GPU once so per-iteration indexing runs on GPU
+    # (avoids CPU gather + PCIe transfer on every one of the 80k training steps)
+    rays_filtered      = rays_filtered.to(device)
+    rgbs_filtered      = rgbs_filtered.to(device)
+    light_idx_filtered = light_idx_filtered.to(device)
     trainingSampler = SimpleSampler(rays_filtered.shape[0], args.batch_size)
 
     pbar = tqdm(range(args.n_iters), miniters=args.progress_refresh_rate, file=sys.stdout) if (
@@ -317,28 +348,50 @@ def reconstruction(args):
     # Stage 2: start with relight_flag=True but gate rendering losses behind warmup
     # During warmup, only normal/smoothness losses run so BRDF+Normal MLPs stabilise
     # before the full rgb_brdf + S3IM objective fires.
-    relight_flag = (args.stage == 2)
-    stage2_warmup_iters = args.stage2_warmup_iters if args.stage == 2 else 0
+    # Unified curriculum overrides both: relight_flag becomes per-iteration.
+    relight_flag = (args.stage == 2) and not args.unified_curriculum
+    stage2_warmup_iters = args.stage2_warmup_iters if (args.stage == 2 and not args.unified_curriculum) else 0
     for iteration in pbar: 
         # Sample batch_size chunk from all rays
         rays_idx = trainingSampler.nextids()
         rays_train = rays_filtered[rays_idx]
-        rgb_train = rgbs_filtered[rays_idx].to(device)
-        light_idx_train = light_idx_filtered[rays_idx].to(device)
+        rgb_train = rgbs_filtered[rays_idx]
+        light_idx_train = light_idx_filtered[rays_idx]
         rgb_with_brdf_train = rgb_train
 
 
-        ret_kw = renderer(  
+        # -------------------------------------------------------------------
+        # Unified curriculum: per-iteration schedule factors (before renderer call)
+        # relight_flag must be set here so the renderer knows whether to run PBR path.
+        # -------------------------------------------------------------------
+        if args.unified_curriculum:
+            # Phase A (0–nep_ramp_start): NeP off, S3IM at half-weight, no BRDF
+            # Phase B (nep_ramp_start–nep_ramp_end): NeP ramps in, no BRDF yet
+            # Phase C (brdf_activation_iter – +brdf_warmup_iters): BRDF + S3IM-brdf ramp in
+            # Phase D (onwards): full joint
+            alpha_nep    = sigmoid_ramp(iteration, args.nep_ramp_start, args.nep_ramp_end)
+            brdf_ramp    = smoothstep(iteration, args.brdf_activation_iter,
+                                      args.brdf_activation_iter + args.brdf_warmup_iters)
+            s3im_rgb_w   = args.s3im_weight * (0.5 + 0.5 * smoothstep(iteration, 0, args.s3im_rgb_ramp_end))
+            s3im_brdf_w  = args.s3im_weight * smoothstep(iteration, args.s3im_brdf_ramp_start, args.s3im_brdf_ramp_end)
+            relight_flag = (iteration >= args.brdf_activation_iter)
+        else:
+            alpha_nep    = 1.0
+            brdf_ramp    = 1.0
+            s3im_rgb_w   = args.s3im_weight
+            s3im_brdf_w  = args.s3im_weight
+
+        ret_kw = renderer(
                             rays=rays_train,    # [batch_size, 6]
                             normal_gt=None,     # [batch_size, 3]
                             light_idx=light_idx_train, # [batch_size, 1]
                             tensoIR=tensoIR,    # nn.Module
                             N_samples=nSamples, # int
                             white_bg=white_bg,  # bool
-                            ndc_ray=ndc_ray, 
+                            ndc_ray=ndc_ray,
                             device=device,
                             sample_method=args.light_sample_train,
-                            chunk_size=args.relight_chunk_size, 
+                            chunk_size=args.relight_chunk_size,
                             is_train=True,
                             is_relight=relight_flag,
                             args=args
@@ -346,36 +399,45 @@ def reconstruction(args):
 
         total_loss = 0
         loss_rgb_brdf = torch.tensor(1e-6).to(device)
+        loss_s3im_brdf = None
 
         # NeP Eq. 4: Dynamic weight w_s for specular-aware MSE
+        # In unified curriculum, alpha_nep interpolates from vanilla MSE (0) to full NeP (1).
         if args.nep_dynamic_weight:
             c_o_map = ret_kw['rgb_map']
             c_a_map = ret_kw['pseudo_albedo_map']
             color_diff = torch.mean((c_o_map - c_a_map) ** 2, dim=-1, keepdim=True)
-            w_s = 1.0 / (color_diff + args.nep_epsilon)
-            w_s = torch.clamp(w_s, max=args.nep_clamp_max)
-            w_s = w_s.detach()  # CRITICAL: stop gradient through weights!
+            w_s_raw = 1.0 / (color_diff + args.nep_epsilon)
+            w_s_raw = torch.clamp(w_s_raw, max=args.nep_clamp_max)
+            w_s_raw = w_s_raw.detach()  # CRITICAL: stop gradient through weights!
+            # Blend: at alpha_nep=0 → uniform weight 1.0 (vanilla MSE); at 1 → full NeP w_s
+            w_s = (1.0 - alpha_nep) * torch.ones_like(w_s_raw) + alpha_nep * w_s_raw
             loss_rgb = torch.mean(w_s * (c_o_map - rgb_train) ** 2)
         else:
+            w_s = None
             loss_rgb = torch.mean((ret_kw['rgb_map'] - rgb_train) ** 2)
 
         total_loss += loss_rgb
 
-        # S3IM loss for base geometry/color (Stage 1)
+        # S3IM loss for base geometry/color
+        # In unified curriculum s3im_rgb_w ramps from 0.5x→1.0x over the first s3im_rgb_ramp_end iters.
         if s3im_loss_fn is not None:
-            loss_s3im = args.s3im_weight * s3im_loss_fn(ret_kw['rgb_map'], rgb_train)
+            loss_s3im = s3im_rgb_w * s3im_loss_fn(ret_kw['rgb_map'], rgb_train)
             total_loss += loss_s3im
 
         if Ortho_reg_weight > 0:
             loss_reg = tensoIR.vector_comp_diffs()
             total_loss += Ortho_reg_weight * loss_reg
             summary_writer.add_scalar('train/reg', loss_reg.detach().item(), global_step=iteration)
-        if L1_reg_weight > 0:
+        # v5: skip density regularisation after freeze iter (frozen params, wasted compute)
+        _density_frozen = args.unified_curriculum and args.freeze_density_iter > 0 \
+                          and iteration >= args.freeze_density_iter
+        if L1_reg_weight > 0 and not _density_frozen:
             loss_reg_L1 = tensoIR.density_L1()
             total_loss += L1_reg_weight * loss_reg_L1
             summary_writer.add_scalar('train/reg_l1', loss_reg_L1.detach().item(), global_step=iteration)
 
-        if TV_weight_density > 0:
+        if TV_weight_density > 0 and not _density_frozen:
             TV_weight_density *= lr_factor
             loss_tv = tensoIR.TV_loss_density(tvreg) * TV_weight_density
             total_loss = total_loss + loss_tv
@@ -389,20 +451,25 @@ def reconstruction(args):
         if relight_flag:
             loss_rgb_brdf = torch.mean((ret_kw['rgb_with_brdf_map'] - rgb_with_brdf_train) ** 2)
 
-            # During Stage 2 warmup: skip rendering and S3IM losses so BRDF/Normal MLPs
-            # stabilise on smoothness/normal losses first before the full objective fires.
+            # During Stage 2 warmup (legacy 2-stage): skip rendering and S3IM losses so
+            # BRDF/Normal MLPs stabilise on smoothness/normal losses first.
+            # In unified curriculum, brdf_ramp (0→1 over brdf_warmup_iters) handles this.
             in_warmup = (stage2_warmup_iters > 0 and iteration < stage2_warmup_iters)
             if not in_warmup:
-                total_loss += loss_rgb_brdf * args.rgb_brdf_weight
+                total_loss += loss_rgb_brdf * args.rgb_brdf_weight * brdf_ramp
 
-                # Step 3.5: Apply S3IM Loss to the final PBR color (Stage 2)
+                # Apply S3IM loss to the final PBR color.
+                # In unified curriculum, s3im_brdf_w ramps from 0→s3im_weight over Phase C.
                 if s3im_loss_fn is not None:
-                    loss_s3im_brdf = args.s3im_weight * s3im_loss_fn(ret_kw['rgb_with_brdf_map'], rgb_with_brdf_train)
+                    loss_s3im_brdf = s3im_brdf_w * s3im_loss_fn(ret_kw['rgb_with_brdf_map'], rgb_with_brdf_train)
                     total_loss += loss_s3im_brdf
 
-            # exponential growth
-            normal_weight_factor = args.normals_loss_enhance_ratio ** ((iteration- update_AlphaMask_list[0])/ (args.n_iters - update_AlphaMask_list[0]))
-            BRDF_weight_factor = args.BRDF_loss_enhance_ratio ** ((iteration- update_AlphaMask_list[0])/ (args.n_iters - update_AlphaMask_list[0]))
+            # Exponential enhance anchored to brdf_activation_iter (unified) or first AlphaMask update (legacy).
+            enhance_anchor = args.brdf_activation_iter if args.unified_curriculum else update_AlphaMask_list[0]
+            enhance_denom  = max(args.n_iters - enhance_anchor, 1)
+            t_enhance      = max(iteration - enhance_anchor, 0) / enhance_denom
+            normal_weight_factor = args.normals_loss_enhance_ratio ** t_enhance
+            BRDF_weight_factor   = args.BRDF_loss_enhance_ratio   ** t_enhance
  
             if args.normals_diff_weight > 0:
                 loss_normals_diff = normal_weight_factor * args.normals_diff_weight * ret_kw['normals_diff_map'].mean()
@@ -447,12 +514,17 @@ def reconstruction(args):
             summary_writer.add_scalar('train/mse_rgb', loss_rgb, global_step=iteration)
             if s3im_loss_fn is not None:
                 summary_writer.add_scalar('train/s3im_loss', loss_s3im.detach().item(), global_step=iteration)
-            if args.nep_dynamic_weight:
+            if args.nep_dynamic_weight and w_s is not None:
                 summary_writer.add_scalar('train/nep_w_s_mean', w_s.mean().item(), global_step=iteration)
+            if args.unified_curriculum:
+                summary_writer.add_scalar('train/curriculum_alpha_nep',    alpha_nep,    global_step=iteration)
+                summary_writer.add_scalar('train/curriculum_brdf_ramp',    brdf_ramp,    global_step=iteration)
+                summary_writer.add_scalar('train/curriculum_s3im_brdf_w',  s3im_brdf_w,  global_step=iteration)
+                summary_writer.add_scalar('train/curriculum_s3im_rgb_w',   s3im_rgb_w,   global_step=iteration)
             if relight_flag:
                 summary_writer.add_scalar('train/PSNRs_rgb_brdf', PSNRs_rgb_brdf[-1], global_step=iteration)
                 summary_writer.add_scalar('train/mse_rgb_brdf', loss_rgb_brdf, global_step=iteration)
-                if s3im_loss_fn is not None and not in_warmup:
+                if s3im_loss_fn is not None and not in_warmup and loss_s3im_brdf is not None:
                     summary_writer.add_scalar('train/s3im_loss_brdf', loss_s3im_brdf.detach().item(), global_step=iteration)
 
             # Print the current values of the losses.
@@ -502,10 +574,16 @@ def reconstruction(args):
         for param_group in optimizer.param_groups:
             param_group['lr'] = param_group['lr'] * lr_factor
 
-
+        # v5 Phase E: freeze density grid to stabilise derived_normals as a fixed target for Normal MLP
+        if args.unified_curriculum and args.freeze_density_iter > 0 \
+                and iteration == args.freeze_density_iter:
+            optimizer.param_groups[0]['lr'] = 0.0   # density_line
+            optimizer.param_groups[1]['lr'] = 0.0   # density_plane
+            print(f"[v5] Density grid frozen at iter {iteration} — derived_normals now a fixed supervision target.")
 
         if iteration in update_AlphaMask_list:
 
+            reso_mask = reso_cur  # default: use current resolution
             if reso_cur[0] * reso_cur[1] * reso_cur[2] < 256 ** 3:  # update volume resolution
                 reso_mask = reso_cur
             new_aabb = tensoIR.updateAlphaMask(tuple(reso_mask))
@@ -514,8 +592,10 @@ def reconstruction(args):
                 # tensorVM.alphaMask = None
                 L1_reg_weight = args.L1_weight_rest
                 print("continuing L1_reg_weight", L1_reg_weight)
-                # The GPU demands will decrease significantly after AlphaMask is generated, so we can begin relighting training
-                relight_flag = True
+                # In legacy 2-stage: activate relighting after first AlphaMask update.
+                # In unified curriculum: relight_flag is determined per-iteration by brdf_activation_iter.
+                if not args.unified_curriculum:
+                    relight_flag = True
                 torch.cuda.empty_cache()
                 TV_weight_density = 0
                 TV_weight_app = 0
@@ -526,6 +606,9 @@ def reconstruction(args):
                 rays_filtered, filter_mask = tensoIR.filtering_rays(all_rays, bbox_only=True)
                 rgbs_filtered = all_rgbs[filter_mask, :]                # [filtered(N*H*W), 3]
                 light_idx_filtered = all_light_idx[filter_mask, :]      # [filtered(N*H*W), 1]
+                rays_filtered      = rays_filtered.to(device)
+                rgbs_filtered      = rgbs_filtered.to(device)
+                light_idx_filtered = light_idx_filtered.to(device)
                 trainingSampler = SimpleSampler(rays_filtered.shape[0], args.batch_size)
     
 

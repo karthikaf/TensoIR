@@ -92,6 +92,28 @@ def config_parser(cmd=None):
     parser.add_argument("--stage2_warmup_iters", type=int, default=0,
                         help='Stage 2 only: warmup iterations where only normal/smoothness losses run, no rgb_brdf or S3IM. Prevents cold-start collapse of BRDF MLP.')
 
+    # Unified 1-stage curriculum
+    parser.add_argument("--unified_curriculum", type=int, default=0,
+                        help='Enable unified 4-phase curriculum (0=disabled, 1=enabled). Replaces the 2-stage checkpoint pipeline with a single 80k run.')
+    parser.add_argument("--nep_ramp_start", type=int, default=20000,
+                        help='Unified curriculum: iteration at which NeP dynamic weighting begins to ramp in (Phase A→B boundary).')
+    parser.add_argument("--nep_ramp_end", type=int, default=35000,
+                        help='Unified curriculum: iteration at which NeP dynamic weighting reaches full strength (Phase B→C boundary).')
+    parser.add_argument("--s3im_rgb_ramp_end", type=int, default=10000,
+                        help='Unified curriculum: iteration at which S3IM-on-rgb_map weight reaches its full value (ramps from 0.5x at iter 0).')
+    parser.add_argument("--brdf_activation_iter", type=int, default=35000,
+                        help='Unified curriculum: iteration at which BRDF rendering path is activated (Phase C start).')
+    parser.add_argument("--brdf_warmup_iters", type=int, default=15000,
+                        help='Unified curriculum: number of iterations to smoothly ramp rgb_brdf_weight from 0 to target after BRDF activation.')
+    parser.add_argument("--s3im_brdf_ramp_start", type=int, default=35000,
+                        help='Unified curriculum: iteration at which S3IM-on-rgb_brdf begins to ramp in.')
+    parser.add_argument("--s3im_brdf_ramp_end", type=int, default=50000,
+                        help='Unified curriculum: iteration at which S3IM-on-rgb_brdf reaches full weight.')
+    parser.add_argument("--freeze_density_iter", type=int, default=0,
+                        help='v5: iteration at which density grid (density_line + density_plane) lr is set to 0, '
+                             'stabilising derived_normals as a fixed supervision target for the Normal MLP. '
+                             '0 = disabled. Recommended: 55000.')
+
     # model
     # volume options
     parser.add_argument("--n_lamb_sigma", type=int, action="append")
