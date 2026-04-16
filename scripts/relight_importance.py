@@ -35,7 +35,7 @@ def relight(dataset, args):
         return
         
 
-    ckpt = torch.load(args.ckpt, map_location=device)
+    ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     kwargs = ckpt['kwargs']
     kwargs.update({'device': device})
     tensoIR = eval(args.model_name)(**kwargs)
@@ -367,7 +367,7 @@ if __name__ == "__main__":
     dataset = dataset_dict[args.dataset_name]
 
     # names of the environment maps used for relighting
-    light_name_list= ['bridge', 'city', 'fireplace', 'forest', 'night']
+    light_name_list= ['courtyard', 'snow', 'sunset', 'bridge', 'fireplace']
 
 
 
