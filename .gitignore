@@ -23,26 +23,35 @@ Thumbs.db
 # =========================
 # Thesis Specific (NeRF & TensoIR)
 # =========================
-# Ignore downloaded datasets
-/data/
-/dataset/
-/Datasets/
-/research \papers/
-/thesis_plots/
-/TensoIR_Results/
-/reference_thesis/
-/Thesis \Draft/
-/reference_thesis_2/
 
-# Ignore massive model checkpoints
-/checkpoints/
+# Large binary data — transfer separately, never commit
+/data/
 /log/
+/relighting/
+
+# Ignore massive model checkpoints (all variants)
+/checkpoints/
 /logs/
 *.pth
 *.pt
 *.ckpt
+*.th
 
-# Ignore rendered outputs (images and videos)
+# Thesis writing & local outputs — not needed on server
+/thesis_draft/
+/thesis_plots/
+/thesis_draft_*.zip
+thesis_monitor_log.*
+professor_review.md
+supervisor_review.md
+thesis_audit.md
+raw.log
+monitor_nohup.log
+relighting_*.log
+/guides/
+/research_papers/
+
+# Rendered outputs (images and videos)
 *.png
 *.jpg
 *.jpeg
@@ -51,16 +60,14 @@ Thumbs.db
 /render/
 /renders/
 
-# Ignore TensorBoard logs
+# TensorBoard logs
 events.out.tfevents.*
-old chat.md
 
-/relighting
+# Misc local files
+/logs_oldpipeline/
+/zipfiles_of_drafts
+/.claude/
+/AUDIT_REPORT.md
+/reference_shreeharsh
+/reference_thesis_2
 
-# log files
-/relighting_ficus_v6.log
-/relighting_hotdog_v6.log
-/relighting_lego_v6.log
-/relighting_vanilla_ficus.log
-/relighting_vanilla_hotdog.log
-/relighting_vanilla_lego.log

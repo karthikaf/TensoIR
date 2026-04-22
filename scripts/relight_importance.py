@@ -289,6 +289,15 @@ def relight(dataset, args):
         for cur_light_name in dataset.light_names:
             f.write(f'{cur_light_name}:  PSNR {np.mean(relight_psnr[cur_light_name])}; SSIM {np.mean(relight_ssim[cur_light_name])}; L_Alex {np.mean(relight_l_alex[cur_light_name])}; L_VGG {np.mean(relight_l_vgg[cur_light_name])}\n')
 
+    # save per-view metric arrays for mean±std reporting
+    npz_dict = {}
+    for cur_light_name in dataset.light_names:
+        npz_dict[f'psnr_{cur_light_name}']      = np.asarray(relight_psnr[cur_light_name])
+        npz_dict[f'ssim_{cur_light_name}']      = np.asarray(relight_ssim[cur_light_name])
+        npz_dict[f'lpips_alex_{cur_light_name}'] = np.asarray(relight_l_alex[cur_light_name])
+        npz_dict[f'lpips_vgg_{cur_light_name}']  = np.asarray(relight_l_vgg[cur_light_name])
+    np.savez(os.path.join(args.geo_buffer_path, 'relight_metrics_per_view.npz'), **npz_dict)
+
     if args.if_save_rgb_video:
         video_path = os.path.join(args.geo_buffer_path,'video')
         os.makedirs(video_path, exist_ok=True)

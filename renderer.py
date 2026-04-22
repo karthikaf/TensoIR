@@ -463,12 +463,17 @@ def evaluation_iter_TensoIR(
         single_aligned_albedo_maps = np.stack(single_aligned_albedo_maps)
         three_aligned_albedo_maps = np.stack(three_aligned_albedo_maps)
         gt_albedo_maps = np.stack(gt_albedo_maps)
-        loss_albedo_single = np.mean((gt_albedo_maps - single_aligned_albedo_maps)**2)
-        loss_albedo_three = np.mean((gt_albedo_maps - three_aligned_albedo_maps)**2)
-        PSNR_albedo_single = -10.0 * np.log(loss_albedo_single) / np.log(10.0)
-        PSNR_albedo_three = -10.0 * np.log(loss_albedo_three) / np.log(10.0)
-        # compute mean angular error
-        MAE = np.mean(np.arccos(np.clip(np.sum(gt_normal_stack * render_normal_stack, axis=-1), -1, 1)) * 180 / np.pi)
+        # per-view albedo PSNR (mean-of-per-view, consistent with NVS PSNR convention)
+        mse_per_view_single = np.mean((gt_albedo_maps - single_aligned_albedo_maps)**2, axis=(1, 2, 3))
+        mse_per_view_three  = np.mean((gt_albedo_maps - three_aligned_albedo_maps)**2,  axis=(1, 2, 3))
+        PSNRs_albedo_single = -10.0 * np.log(mse_per_view_single) / np.log(10.0)
+        PSNRs_albedo_three  = -10.0 * np.log(mse_per_view_three)  / np.log(10.0)
+        PSNR_albedo_single = np.mean(PSNRs_albedo_single)
+        PSNR_albedo_three  = np.mean(PSNRs_albedo_three)
+        # per-view Normal MAE, then mean
+        per_pixel_angles = np.arccos(np.clip(np.sum(gt_normal_stack * render_normal_stack, axis=-1), -1, 1)) * 180 / np.pi
+        MAEs = np.mean(per_pixel_angles, axis=-1)  # (N_views,)
+        MAE = np.mean(MAEs)
         if compute_extra_metrics:
             ssim = np.mean(np.asarray(ssims))
             l_a = np.mean(np.asarray(l_alex))
@@ -494,6 +499,24 @@ def evaluation_iter_TensoIR(
                             + f'\tSSIM_albedo_single: {ssim_albedo_single:.4f}, L_Alex_albedo_single: {l_a_albedo_single:.4f}, L_VGG_albedo_single: {l_v_albedo_single:.4f}\n' \
                             + f'\tSSIM_albedo_three: {ssim_albedo_three:.4f}, L_Alex_albedo_three: {l_a_albedo_three:.4f}, L_VGG_albedo_three: {l_v_albedo_three:.4f}\n' \
                             + f'\tMAE: {MAE:.2f}\n'
+
+            # save per-view metric arrays for mean±std reporting
+            np.savez(
+                f'{savePath}/metrics_per_view.npz',
+                psnr_nvs=np.asarray(PSNRs_rgb),
+                psnr_brdf=np.asarray(PSNRs_rgb_brdf),
+                mae=MAEs,
+                psnr_alb_single=PSNRs_albedo_single,
+                psnr_alb_three=PSNRs_albedo_three,
+                ssim_nvs=np.asarray(ssims),
+                ssim_brdf=np.asarray(ssims_rgb_brdf),
+                ssim_alb_single=np.asarray(ssims_albedo_single),
+                ssim_alb_three=np.asarray(ssims_albedo_three),
+                lpips_vgg_nvs=np.asarray(l_vgg),
+                lpips_vgg_brdf=np.asarray(l_vgg_rgb_brdf),
+                lpips_vgg_alb_single=np.asarray(l_vgg_albedo_single),
+                lpips_vgg_alb_three=np.asarray(l_vgg_albedo_three),
+            )
 
         else:
             saved_message = f'Iteration:{prtx[:-1]}, PSNR_nvs: {psnr:.2f}, PSNR_nvs_brdf: {psnr_rgb_brdf:.2f}, MAE: {MAE:.2f}, PSNR_albedo_single_aligned: {PSNR_albedo_single:.2f}, PSNR_albedo_three_aligned: {PSNR_albedo_three:.2f}\n'
@@ -1133,12 +1156,17 @@ def evaluation_iter_TensoIR_general_multi_lights(
         single_aligned_albedo_maps = np.stack(single_aligned_albedo_maps)
         three_aligned_albedo_maps = np.stack(three_aligned_albedo_maps)
         gt_albedo_maps = np.stack(gt_albedo_maps)
-        loss_albedo_single = np.mean((gt_albedo_maps - single_aligned_albedo_maps)**2)
-        loss_albedo_three = np.mean((gt_albedo_maps - three_aligned_albedo_maps)**2)
-        PSNR_albedo_single = -10.0 * np.log(loss_albedo_single) / np.log(10.0)
-        PSNR_albedo_three = -10.0 * np.log(loss_albedo_three) / np.log(10.0)
-        # compute mean angular error
-        MAE = np.mean(np.arccos(np.clip(np.sum(gt_normal_stack * render_normal_stack, axis=-1), -1, 1)) * 180 / np.pi)
+        # per-view albedo PSNR (mean-of-per-view, consistent with NVS PSNR convention)
+        mse_per_view_single = np.mean((gt_albedo_maps - single_aligned_albedo_maps)**2, axis=(1, 2, 3))
+        mse_per_view_three  = np.mean((gt_albedo_maps - three_aligned_albedo_maps)**2,  axis=(1, 2, 3))
+        PSNRs_albedo_single = -10.0 * np.log(mse_per_view_single) / np.log(10.0)
+        PSNRs_albedo_three  = -10.0 * np.log(mse_per_view_three)  / np.log(10.0)
+        PSNR_albedo_single = np.mean(PSNRs_albedo_single)
+        PSNR_albedo_three  = np.mean(PSNRs_albedo_three)
+        # per-view Normal MAE, then mean
+        per_pixel_angles = np.arccos(np.clip(np.sum(gt_normal_stack * render_normal_stack, axis=-1), -1, 1)) * 180 / np.pi
+        MAEs = np.mean(per_pixel_angles, axis=-1)  # (N_views,)
+        MAE = np.mean(MAEs)
         if compute_extra_metrics:
             ssim = np.mean(np.asarray(ssims))
             l_a = np.mean(np.asarray(l_alex))
@@ -1164,6 +1192,24 @@ def evaluation_iter_TensoIR_general_multi_lights(
                             + f'\tSSIM_albedo_single: {ssim_albedo_single:.4f}, L_Alex_albedo_single: {l_a_albedo_single:.4f}, L_VGG_albedo_single: {l_v_albedo_single:.4f}\n' \
                             + f'\tSSIM_albedo_three: {ssim_albedo_three:.4f}, L_Alex_albedo_three: {l_a_albedo_three:.4f}, L_VGG_albedo_three: {l_v_albedo_three:.4f}\n' \
                             + f'\tMAE: {MAE:.2f}\n'
+
+            # save per-view metric arrays for mean±std reporting
+            np.savez(
+                f'{savePath}/metrics_per_view.npz',
+                psnr_nvs=np.asarray(PSNRs_rgb),
+                psnr_brdf=np.asarray(PSNRs_rgb_brdf),
+                mae=MAEs,
+                psnr_alb_single=PSNRs_albedo_single,
+                psnr_alb_three=PSNRs_albedo_three,
+                ssim_nvs=np.asarray(ssims),
+                ssim_brdf=np.asarray(ssims_rgb_brdf),
+                ssim_alb_single=np.asarray(ssims_albedo_single),
+                ssim_alb_three=np.asarray(ssims_albedo_three),
+                lpips_vgg_nvs=np.asarray(l_vgg),
+                lpips_vgg_brdf=np.asarray(l_vgg_rgb_brdf),
+                lpips_vgg_alb_single=np.asarray(l_vgg_albedo_single),
+                lpips_vgg_alb_three=np.asarray(l_vgg_albedo_three),
+            )
 
         else:
             saved_message = f'Iteration:{prtx[:-1]}, PSNR_nvs: {psnr:.2f}, PSNR_nvs_brdf: {psnr_rgb_brdf:.2f}, MAE: {MAE:.2f}, PSNR_albedo_single_aligned: {PSNR_albedo_single:.2f}, PSNR_albedo_three_aligned: {PSNR_albedo_three:.2f}\n'
